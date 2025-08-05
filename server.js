@@ -2,7 +2,6 @@ const express = require("express");
 const https = require("https");
 const cors = require("cors");
 require("dotenv").config();
-const axios = require("axios"); // <--- ADDED THIS NEW LIBRARY
 
 const app = express();
 const API_KEY = process.env.API_KEY;
@@ -11,67 +10,83 @@ const API_KEY = process.env.API_KEY;
 const apiCache = new Map();
 const CACHE_TTL_MS = 1000 * 60 * 30; // Cache data for 30 minutes
 
+// --- START: MODIFICATION ---
 // New cache for exchange rates to avoid repeated API calls.
 const exchangeRateCache = new Map();
 
 /**
- * This function is kept for the /fetch endpoint which needs a quick, latest rate for initial sorting.
- * The final display will use the more accurate true average rates.
+ * Fetches and caches exchange rates to convert various currencies to USD.
+ * It fetches all rates relative to USD in a single API call.
  */
 async function getUsdExchangeRates() {
   const cacheKey = "usd_rates";
   const cached = exchangeRateCache.get(cacheKey);
-
+  // Use cache if it's not older than 6 hours
   if (cached && cached.expiry > Date.now()) {
     return cached.data;
   }
-
   try {
-    console.log("[RATES] Fetching latest USD exchange rates for sorting...");
+    console.log("[RATES] Fetching latest USD exchange rates...");
+    // This API provides rates as "1 USD = X other_currency".
     const ratesData = await fetchDataWithRetry(
-      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
+      "https://v6.exchangerate-api.com/v6/c657063f699b1569b025210f/latest/USD"
     );
-
-    if (ratesData && ratesData.usd) {
-      const rates = ratesData.usd;
+    if (ratesData && ratesData.conversion_rates) {
+      const rates = ratesData.conversion_rates;
       exchangeRateCache.set(cacheKey, {
         data: rates,
-        expiry: Date.now() + 1000 * 60 * 60 * 6,
+        expiry: Date.now() + 1000 * 60 * 60 * 6, // Cache for 6 hours
       });
       return rates;
     }
     throw new Error("Invalid rate data structure received.");
   } catch (error) {
     console.error(`[RATES] Could not fetch exchange rates: ${error.message}`);
-    return { usd: 1.0 };
+    // Return a default object on failure to prevent crashes
+    return { USD: 1.0 };
   }
 }
+// --- END: MODIFICATION ---
 
 // --- CORE HELPER FUNCTIONS ---
 
+/**
+ * Determines the currency for a company, defaulting to USD.
+ */
 function getCompanyCurrency(company) {
+  // First, check the 'reportedCurrency' field from the new endpoints
   if (company && company.reportedCurrency)
     return company.reportedCurrency.toUpperCase();
   if (company && company.currency) return company.currency.toUpperCase();
   if (company && company.symbol) {
     const symbol = company.symbol.toUpperCase();
     if (symbol.endsWith(".SR")) return "SAR";
-    // Add other suffixes as needed
+    // Add other suffixes as needed (.L, .TO, etc.)
   }
   return "USD";
 }
 
+/**
+ * Standardizes industry names to handle API inconsistencies.
+ */
 function getStandardizedIndustry(industry) {
   if (!industry) return "Unknown";
   const normalized = industry.toLowerCase().trim();
   if (normalized.includes("telecom")) {
     return "Telecommunications Services";
   }
+  // Add other rules as needed
   return industry;
 }
 
+/**
+ * A simple promise-based delay function.
+ */
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Returns mock data if the API fails catastrophically.
+ */
 function getMockData(companyCode, year) {
   console.log(`[MOCK] Generating mock data for ${companyCode}, ${year}`);
   const mockCompanies = Array.from({ length: 20 }, (_, i) => ({
@@ -123,98 +138,16 @@ app.use((req, res, next) => {
   next();
 });
 
-
-// +++ START: NEW SERVER CODE FOR TRUE ANNUAL AVERAGE EXCHANGE RATES VIA API +++
-
-const trueAverageRateCache = new Map();
-
-// This is our new, definitive endpoint. The client will call this.
-app.get('/fetch-true-average-rates', async (req, res) => {
-    const { year } = req.query;
-
-    if (!year || isNaN(parseInt(year))) {
-        return res.status(400).json({ error: 'A valid year is required.' });
-    }
-
-    // 1. Check our cache first. If we already have the data, return it instantly.
-    if (trueAverageRateCache.has(year)) {
-        console.log(`[CACHE] Returning TRUE average rates for ${year} from cache.`);
-        return res.status(200).json(trueAverageRateCache.get(year));
-    }
-
-    console.log(`[API] Fetching daily rates from Frankfurter.app to calculate TRUE average for ${year}...`);
-
-    try {
-        // 2. Make a single API call to get all daily rates for the entire year, based in USD.
-        const apiUrl = `https://api.frankfurter.app/${year}-01-01..${year}-12-31?from=USD`;
-        const { data } = await axios.get(apiUrl);
-
-        if (!data || !data.rates || Object.keys(data.rates).length === 0) {
-            throw new Error('API did not return any rate data for the specified year.');
-        }
-
-        // 3. Calculate the average for each currency.
-        const dailyRates = data.rates;
-        const sums = {};
-        const counts = {};
-
-        // Initialize sums and counts for all currencies found on the first day.
-        const firstDayRates = dailyRates[Object.keys(dailyRates)[0]];
-        for (const currency in firstDayRates) {
-            sums[currency] = 0;
-            counts[currency] = 0;
-        }
-
-        // Loop through each day returned by the API.
-        for (const date in dailyRates) {
-            // Loop through each currency for that day.
-            for (const currency in dailyRates[date]) {
-                if (sums.hasOwnProperty(currency)) {
-                    sums[currency] += dailyRates[date][currency];
-                    counts[currency]++;
-                }
-            }
-        }
-        
-        // 4. Finalize the averages and format the response.
-        const finalAverages = {};
-        for (const currency in sums) {
-            if (counts[currency] > 0) {
-                // The average rate of "Foreign Currency per 1 USD"
-                const avgRate = sums[currency] / counts[currency];
-                // We store the inverse for easier math on the client: "USD per 1 Foreign Currency"
-                finalAverages[currency] = 1 / avgRate;
-            }
-        }
-        
-        // Add USD to the list for completeness.
-        finalAverages['USD'] = 1;
-
-        const responsePayload = {
-            source: 'Frankfurter.app (Annual Average)',
-            year: year,
-            rates: finalAverages
-        };
-
-        // 5. Store the result in our cache for future requests.
-        trueAverageRateCache.set(year, responsePayload);
-
-        console.log(`[API] Successfully calculated and cached true average for ${Object.keys(finalAverages).length} currencies.`);
-        res.status(200).json(responsePayload);
-
-    } catch (error) {
-        console.error(`[API] Failed to get true average rates for ${year}:`, error.message);
-        if (error.response) {
-            // Handle API-specific errors (e.g., bad request for a future year)
-            return res.status(error.response.status).json({ error: `The currency API failed: ${error.response.data.message || 'Unknown API Error'}` });
-        }
-        res.status(500).json({ error: 'An internal server error occurred while processing exchange rates.' });
-    }
-});
-
-// +++ END: NEW SERVER CODE +++
-
-
+// --- START: NEW DUPLICATE HANDLING ---
+/**
+ * De-duplicates a list of companies based on name similarity and specific rules.
+ * Rules:
+ * 1. Groups companies by a "base name" (e.g., "AT&T Inc 5.35%" and "AT&T Inc" both become "AT&T Inc").
+ * 2. If a group has duplicates, it prefers companies where `isActivelyTrading` is true.
+ * 3. If multiple companies are actively trading, it chooses the one with the oldest `ipoDate`.
+ * 4. If a group of duplicates has no actively trading companies, it is removed entirely.
+ * 5. Unique companies (not duplicates) are ALWAYS kept.
+ */
 function deduplicateCompanies(companies) {
   if (!companies || companies.length === 0) {
     return [];
@@ -225,11 +158,13 @@ function deduplicateCompanies(companies) {
 
   const companyGroups = new Map();
 
+  // Heuristic to find the "base name".
   const getBaseName = (name) => {
     if (!name) return "";
     return name.replace(/\s+\d+(\.\d+)?%.*$/, "").trim();
   };
 
+  // Step 1: Group companies by their base name.
   for (const company of companies) {
     if (
       !company.companyName ||
@@ -250,17 +185,23 @@ function deduplicateCompanies(companies) {
   }
 
   const finalCompanies = [];
+  // Step 2: Process each group to find the single best candidate.
   for (const [baseName, candidates] of companyGroups.entries()) {
+    // **CORRECTED LOGIC**: If a company is unique by name, it's not a duplicate. Keep it.
     if (candidates.length === 1) {
       finalCompanies.push(candidates[0]);
       continue;
     }
 
+    // --- The following logic now ONLY applies to actual duplicates (groups with >1 company) ---
+
+    // Rule 1: Filter for actively trading companies.
     let activeCompanies = candidates.filter(
       (c) => c.isActivelyTrading === true,
     );
 
     if (activeCompanies.length === 0) {
+      // All candidates in the duplicate group are inactive. As per the logic, we don't include any of them.
       console.log(
         `[DEDUPE] Duplicate group "${baseName}" has ${candidates.length} candidates, but none are active. Skipping.`,
       );
@@ -268,6 +209,7 @@ function deduplicateCompanies(companies) {
     }
 
     if (activeCompanies.length === 1) {
+      // Exactly one is active. This is our winner for the duplicate group.
       finalCompanies.push(activeCompanies[0]);
       console.log(
         `[DEDUPE] Duplicate group "${baseName}" resolved to one active company: ${activeCompanies[0].symbol}`,
@@ -275,10 +217,11 @@ function deduplicateCompanies(companies) {
       continue;
     }
 
+    // Rule 2: Tie-breaker. More than one is active, so we use the oldest IPO date.
     console.log(
       `[DEDUPE] Duplicate group "${baseName}" has ${activeCompanies.length} active candidates. Using IPO date to break tie.`,
     );
-    activeCompanies.sort((a, b) => new Date(a.ipoDate) - new Date(b.ipoDate));
+    activeCompanies.sort((a, b) => new Date(a.ipoDate) - new Date(b.ipoDate)); // Sorts by date, oldest first
 
     const winner = activeCompanies[0];
     finalCompanies.push(winner);
@@ -292,6 +235,7 @@ function deduplicateCompanies(companies) {
   );
   return finalCompanies;
 }
+// --- END: NEW DUPLICATE HANDLING ---
 
 // =========================================================================
 //  MAIN ENDPOINT: /fetch
@@ -310,6 +254,7 @@ app.get("/fetch", async (req, res) => {
       });
     }
 
+    // --- Step 1: Get the full list of potential peers from the screener ---
     const screenerCompanies = await getFullScreenerList(code, year);
     if (screenerCompanies.length === 0) {
       console.log(
@@ -321,6 +266,7 @@ app.get("/fetch", async (req, res) => {
       `[FETCH] Found ${screenerCompanies.length} potential peers. Starting data enrichment...`,
     );
 
+    // --- Step 2: Efficient Data Enrichment ---
     const enrichedPool = await enrichCompaniesWithHistoricalMarketCap(
       screenerCompanies,
       year,
@@ -331,7 +277,8 @@ app.get("/fetch", async (req, res) => {
       `[FETCH] Data enrichment complete. Have valid data for ${enrichedPool.length} companies.`,
     );
 
-    const rates = await getTrueAverageRates(year);
+    // --- Step 2.5: Normalize market caps to USD for accurate sorting ---
+    const rates = await getUsdExchangeRates();
     const normalizedPool = enrichedPool.map((company) => {
       const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
       const rate = rates[currency];
@@ -348,11 +295,17 @@ app.get("/fetch", async (req, res) => {
       };
     });
 
+    // --- Step 3: Sort the enriched list using the USD-normalized market cap ---
     const sortedVerifiedPool = normalizedPool.sort(
       (a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0),
     );
 
+    // --- START: NEW DUPLICATE HANDLING ---
+    // Apply the de-duplication logic to the entire pool of companies
     const deduplicatedPool = deduplicateCompanies(sortedVerifiedPool);
+    // --- END: NEW DUPLICATE HANDLING ---
+
+    // --- Use the de-duplicated list for all subsequent operations ---
     deduplicatedPool.forEach((c) => (c.isSelected = c.symbol === code));
 
     const topCompanies = deduplicatedPool.slice(0, 10);
@@ -378,7 +331,7 @@ app.get("/fetch", async (req, res) => {
 
       comparisonCompanies = deduplicatedPool.slice(startIndex, endIndex);
     } else {
-      comparisonCompanies = deduplicatedPool.slice(0, 20);
+      comparisonCompanies = deduplicatedPool.slice(0, 20); // If not found, just return the top 20
       console.warn(
         `[FETCH] Selected company ${code} not found in final verified pool. Peer chart will show top companies.`,
       );
@@ -388,7 +341,7 @@ app.get("/fetch", async (req, res) => {
       `[FETCH] Request complete. Returning ${topCompanies.length} top companies and ${comparisonCompanies.length} comparison companies.`,
     );
     res.json({
-      allCompanies: deduplicatedPool,
+      allCompanies: deduplicatedPool, // Return the clean list
       topCompanies,
       comparisonCompanies,
     });
@@ -407,6 +360,9 @@ app.get("/fetch", async (req, res) => {
 //  DATA FETCHING & PROCESSING HELPERS
 // =========================================================================
 
+/**
+ * Fetches data from the FMP API with a retry mechanism.
+ */
 async function fetchDataWithRetry(url, retries = 3, backoff = 500) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -454,6 +410,9 @@ async function fetchDataWithRetry(url, retries = 3, backoff = 500) {
   }
 }
 
+/**
+ * Centralized, cached function to get annual data from the new FMP "stable" endpoints.
+ */
 async function getCachedAnnualData(symbol, endpoint) {
   const cacheKey = `${symbol}:${endpoint}`;
   const cached = apiCache.get(cacheKey);
@@ -479,12 +438,15 @@ async function getCachedAnnualData(symbol, endpoint) {
     );
     apiCache.set(cacheKey, {
       data: null,
-      expiry: Date.now() + 1000 * 60 * 5,
+      expiry: Date.now() + 1000 * 60 * 5, // Cache failure for 5 mins
     });
     return null;
   }
 }
 
+/**
+ * Fetches the list of companies from the stock screener.
+ */
 async function fetchSectorCompanies(industry, country = null) {
   let url = `https://financialmodelingprep.com/api/v3/stock-screener?industry=${encodeURIComponent(industry)}&limit=10000&apikey=${API_KEY}`;
   if (country) url += `&country=${country}`;
@@ -510,6 +472,9 @@ async function fetchSectorCompanies(industry, country = null) {
   }
 }
 
+/**
+ * Orchestrates the initial screener fetches to get a full list of unique potential peers.
+ */
 async function getFullScreenerList(code, year) {
   const primaryCompanyProfile = await fetchBasicCompanyData(code, year);
   if (!primaryCompanyProfile) return [];
@@ -551,86 +516,83 @@ async function getFullScreenerList(code, year) {
   return Array.from(screenerCompanyMap.values());
 }
 
-async function enrichCompaniesWithHistoricalMarketCap(
-  companies,
-  year,
-  batchSize,
-  delayMs,
-) {
+/**
+ * Enriches companies with historical market cap data with robust fallbacks.
+ */
+async function enrichCompaniesWithHistoricalMarketCap(companies, year, batchSize, delayMs) {
   const enrichedCompanies = [];
+  const rates = await getUsdExchangeRates(); // Fetch exchange rates
+
   for (let i = 0; i < companies.length; i += batchSize) {
     const batchCompanies = companies.slice(i, i + batchSize);
-    console.log(
-      `[ENRICH] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(companies.length / batchSize)}...`,
-    );
-
+    console.log(`[ENRICH] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(companies.length / batchSize)}...`);
     const batchPromises = batchCompanies.map(async (company) => {
+      // Fetch all potential data sources at once for efficiency
       const [evRes, metricsRes, profileRes] = await Promise.all([
-        getCachedAnnualData(company.symbol, "enterprise-values"),
-        getCachedAnnualData(company.symbol, "key-metrics"),
-        getCachedAnnualData(company.symbol, "profile"),
+        getCachedAnnualData(company.symbol, 'enterprise-values'),
+        getCachedAnnualData(company.symbol, 'key-metrics'),
+        getCachedAnnualData(company.symbol, 'profile')
       ]);
 
-      const evData = Array.isArray(evRes)
-        ? evRes.find(
-            (ev) => ev.date && String(ev.date).startsWith(String(year)),
-          )
-        : null;
-      const metricsData = Array.isArray(metricsRes)
-        ? metricsRes.find((m) => String(m.fiscalYear) === String(year))
-        : null;
+      // Find the data for the specific year from each source
+      const evData = Array.isArray(evRes) ? evRes.find(ev => ev.date && String(ev.date).startsWith(String(year))) : null;
+      const metricsData = Array.isArray(metricsRes) ? metricsRes.find(m => String(m.fiscalYear) === String(year)) : null;
       const profileData = Array.isArray(profileRes) ? profileRes[0] : null;
 
+      // If we don't have basic profile info, we can't proceed.
       if (!profileData) {
-        console.warn(
-          `[ENRICH] ${company.symbol}: No profile data found. It will be excluded.`,
-        );
+        console.warn(`[ENRICH] ${company.symbol}: No profile data found. It will be excluded.`);
         return null;
       }
 
+      // Step 1: Reliably determine the FINANCIAL currency. Prioritize key-metrics.
       let financialCurrency;
       if (metricsData && metricsData.reportedCurrency) {
         financialCurrency = metricsData.reportedCurrency;
       } else {
+        // Fallback to profile currency if key-metrics is unavailable. This is less reliable.
         financialCurrency = getCompanyCurrency(profileData);
-        console.warn(
-          `[ENRICH-CURRENCY] ${company.symbol}: Using profile currency '${financialCurrency}' as fallback.`,
-        );
+        console.warn(`[ENRICH-CURRENCY] ${company.symbol}: Using profile currency '${financialCurrency}' as fallback.`);
       }
 
+      // Step 2: Determine the best market cap value, prioritizing the new endpoint.
       let marketCapValue = 0;
       if (evData && evData.marketCapitalization > 0) {
+        // Primary source: /enterprise-values
         marketCapValue = evData.marketCapitalization;
       } else if (metricsData && metricsData.marketCap > 0) {
-        console.warn(
-          `[ENRICH-FALLBACK] ${company.symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`,
-        );
+        // First fallback: /key-metrics
+        console.warn(`[ENRICH-FALLBACK] ${company.symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`);
         marketCapValue = metricsData.marketCap;
       } else if (profileData && profileData.mktCap > 0) {
-        console.warn(
-          `[ENRICH-FALLBACK] ${company.symbol}: No historical data, using LIVE 'profile' market cap.`,
-        );
+        // Final fallback: live data from /profile
+        console.warn(`[ENRICH-FALLBACK] ${company.symbol}: No historical data, using LIVE 'profile' market cap.`);
         marketCapValue = profileData.mktCap;
       }
 
+      // Step 3: If we found a valid market cap, build and return the company object.
       if (marketCapValue > 0) {
-        company.marketCap = marketCapValue;
+        // Convert market cap to USD using exchange rates
+        const currency = financialCurrency.toLowerCase();
+        const rate = rates[currency];
+        let marketCapUSD = marketCapValue;
+        if (currency !== 'usd' && rate) {
+          marketCapUSD = marketCapValue / rate;
+        }
+
+        company.marketCap = marketCapUSD;
         company.currency = financialCurrency;
         company.companyName = profileData.companyName || company.companyName;
         company.sector = profileData.sector || company.sector;
-        company.industry =
-          getStandardizedIndustry(profileData.industry) || company.industry;
+        company.industry = getStandardizedIndustry(profileData.industry) || company.industry;
         company.country = profileData.country || company.country;
-
         company.isActivelyTrading = profileData.isActivelyTrading;
         company.ipoDate = profileData.ipoDate;
 
         return company;
       }
 
-      console.warn(
-        `[ENRICH] ${company.symbol}: Could not find any valid market cap for year ${year}. It will be excluded.`,
-      );
+      console.warn(`[ENRICH] ${company.symbol}: Could not find any valid market cap for year ${year}. It will be excluded.`);
       return null;
     });
 
@@ -638,74 +600,78 @@ async function enrichCompaniesWithHistoricalMarketCap(
     enrichedCompanies.push(...batchResults.filter(Boolean));
     if (i + batchSize < companies.length) await delay(delayMs);
   }
-  return enrichedCompanies.filter(
-    (c) => c && typeof c.marketCap === "number" && c.marketCap > 0,
-  );
+
+  return enrichedCompanies.filter(c => c && typeof c.marketCap === 'number' && c.marketCap > 0);
 }
 
+
+/**
+ * Fetches the definitive annual data for a single company using the cache.
+ */
 async function fetchBasicCompanyData(symbol, year) {
   if (!symbol) return null;
+
+  const rates = await getUsdExchangeRates(); // Fetch exchange rates
+
   try {
     const [evRes, metricsRes, profileRes] = await Promise.all([
-      getCachedAnnualData(symbol, "enterprise-values"),
-      getCachedAnnualData(symbol, "key-metrics"),
-      getCachedAnnualData(symbol, "profile"),
+      getCachedAnnualData(symbol, 'enterprise-values'),
+      getCachedAnnualData(symbol, 'key-metrics'),
+      getCachedAnnualData(symbol, 'profile')
     ]);
 
     const profileData = Array.isArray(profileRes) ? profileRes[0] : null;
     if (!profileData) return null;
 
-    const evData = Array.isArray(evRes)
-      ? evRes.find((ev) => ev.date && String(ev.date).startsWith(String(year)))
-      : null;
-    const metricsData = Array.isArray(metricsRes)
-      ? metricsRes.find((m) => String(m.fiscalYear) === String(year))
-      : null;
+    const evData = Array.isArray(evRes) ? evRes.find(ev => ev.date && String(ev.date).startsWith(String(year))) : null;
+    const metricsData = Array.isArray(metricsRes) ? metricsRes.find(m => String(m.fiscalYear) === String(year)) : null;
 
+    // Step 1: Reliably determine financial currency from key-metrics
     let financialCurrency;
     if (metricsData && metricsData.reportedCurrency) {
       financialCurrency = metricsData.reportedCurrency;
     } else {
       financialCurrency = getCompanyCurrency(profileData);
-      console.warn(
-        `[DATA-CURRENCY] ${symbol}: Using profile currency '${financialCurrency}' as fallback.`,
-      );
+      console.warn(`[DATA-CURRENCY] ${symbol}: Using profile currency '${financialCurrency}' as fallback.`);
     }
 
+    // Step 2: Determine market cap value with proper fallbacks
     let marketCapValue = 0;
     if (evData && evData.marketCapitalization > 0) {
       marketCapValue = evData.marketCapitalization;
     } else if (metricsData && metricsData.marketCap > 0) {
-      console.warn(
-        `[DATA-FALLBACK] ${symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`,
-      );
+      console.warn(`[DATA-FALLBACK] ${symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`);
       marketCapValue = metricsData.marketCap;
     } else if (profileData && profileData.mktCap > 0) {
-      console.warn(
-        `[DATA-FALLBACK] ${symbol}: No historical data, using LIVE 'profile' market cap.`,
-      );
+      console.warn(`[DATA-FALLBACK] ${symbol}: No historical data, using LIVE 'profile' market cap.`);
       marketCapValue = profileData.mktCap;
+    }
+
+    // Convert market cap to USD using exchange rates
+    const currency = financialCurrency.toLowerCase();
+    const rate = rates[currency];
+    let marketCapUSD = marketCapValue;
+    if (currency !== 'usd' && rate) {
+      marketCapUSD = marketCapValue / rate;
     }
 
     return {
       symbol: profileData.symbol,
       companyName: profileData.companyName,
-      marketCap: marketCapValue,
+      marketCap: marketCapUSD,
       sector: profileData.sector,
       industry: getStandardizedIndustry(profileData.industry),
       country: profileData.country,
       currency: financialCurrency,
-
       isActivelyTrading: profileData.isActivelyTrading,
-      ipoDate: profileData.ipoDate,
+      ipoDate: profileData.ipoDate
     };
   } catch (e) {
-    console.error(
-      `[DATA] Error fetching basic data for ${symbol}: ${e.message}`,
-    );
+    console.error(`[DATA] Error fetching basic data for ${symbol}: ${e.message}`);
     return null;
   }
 }
+
 
 // =========================================================================
 //  ADDITIONAL ENDPOINTS (/fetch-metric, /fetch-peers)
@@ -728,6 +694,7 @@ app.get("/fetch-metric", async (req, res) => {
     if (i + MAX_CONCURRENT < symbolList.length) await delay(200);
   }
 
+  // Attach the reported currency to the response
   const finalResultsWithCurrency = results.filter(Boolean).map((result) => {
     const originalData = result.originalData || {};
     return {
@@ -788,7 +755,8 @@ app.get("/fetch-peers", async (req, res) => {
     500,
   );
 
-  const rates = await getTrueAverageRates(year);
+  // Apply the same normalization logic here for accurate sorting
+  const rates = await getUsdExchangeRates();
   const normalizedPeers = verifiedPeers.map((company) => {
     const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
     const rate = rates[currency];
@@ -806,7 +774,10 @@ app.get("/fetch-peers", async (req, res) => {
     (a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0),
   );
 
+  // --- START: NEW DUPLICATE HANDLING ---
+  // Also apply de-duplication here for consistency
   const deduplicatedPeers = deduplicateCompanies(sorted);
+  // --- END: NEW DUPLICATE HANDLING ---
 
   const allCompaniesResponse = deduplicatedPeers.map((c) => ({
     ...c,
@@ -820,6 +791,10 @@ app.get("/fetch-peers", async (req, res) => {
   });
 });
 
+/**
+ * REVISED
+ * This map now points to the new /stable/key-metrics and /stable/ratios endpoints.
+ */
 const fullMetricEndpointMap = {
   marketCap: { endpoint: "key-metrics", field: "marketCap" },
   enterpriseValue: { endpoint: "key-metrics", field: "enterpriseValue" },
@@ -1044,17 +1019,33 @@ const fullMetricEndpointMap = {
   },
 };
 
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
 async function fetchMetricData(symbol, year, metric) {
+  // START: REVISED SPECIAL CASE FOR 'Revenue per FTE'
   if (metric === "revenuePerFte") {
     console.log(
       `[METRIC] Calculating special metric 'revenuePerFte' for ${symbol}`,
     );
     try {
+      // We need data from two different sources. Let's fetch them in parallel.
       const [incomeStatementData, profileDataRes] = await Promise.all([
-        getCachedAnnualData(symbol, "income-statement"),
-        getCachedAnnualData(symbol, "profile"),
+        getCachedAnnualData(symbol, "income-statement"), // Gets historical revenue
+        getCachedAnnualData(symbol, "profile"), // Gets latest employee count
       ]);
 
+      // --- Step 1: Process the Income Statement to get Revenue ---
+      // Use fallback logic to find the most recent revenue data if the exact year is missing.
       let revenueYearData = Array.isArray(incomeStatementData)
         ? incomeStatementData.find((d) => String(d.fiscalYear) === String(year))
         : null;
@@ -1070,19 +1061,24 @@ async function fetchMetricData(symbol, year, metric) {
         incomeStatementData.sort(
           (a, b) => parseInt(b.fiscalYear) - parseInt(a.fiscalYear),
         );
-        revenueYearData = incomeStatementData[0];
+        revenueYearData = incomeStatementData[0]; // Use the most recent one (e.g., 2023)
       }
 
+      // --- Step 2: Process the Profile to get Full Time Employees ---
+      // The profile endpoint returns an array with one object.
       const profileData = Array.isArray(profileDataRes)
         ? profileDataRes[0]
         : null;
 
+      // --- Step 3: Perform the calculation ---
+      // Check if we have everything we need from both sources.
       if (
         revenueYearData &&
         revenueYearData.revenue != null &&
         profileData &&
         profileData.fullTimeEmployees > 0
       ) {
+        // The 'fullTimeEmployees' from the profile can be a string, so we must parse it.
         const revenue = revenueYearData.revenue;
         const employees = parseInt(profileData.fullTimeEmployees, 10);
 
@@ -1101,9 +1097,11 @@ async function fetchMetricData(symbol, year, metric) {
         return {
           symbol,
           [metric]: calculatedValue,
+          // The income statement data is the one with the financial currency.
           originalData: revenueYearData,
         };
       } else {
+        // Log a more detailed reason why the calculation failed.
         let reason = "Required data not available.";
         if (!revenueYearData || revenueYearData.revenue == null) {
           reason = `Revenue for year ${year} (or fallback) not found.`;
@@ -1128,7 +1126,9 @@ async function fetchMetricData(symbol, year, metric) {
       return { symbol, [metric]: "N/A" };
     }
   }
+  // END: REVISED SPECIAL CASE
 
+  // --- The rest of the function for all other metrics remains the same ---
   const info = fullMetricEndpointMap[metric];
   if (!info) {
     console.warn(`[METRIC] No mapping found for metric: ${metric}`);
@@ -1145,7 +1145,7 @@ async function fetchMetricData(symbol, year, metric) {
       symbol,
       [metric]:
         yearData && yearData[info.field] != null ? yearData[info.field] : "N/A",
-      originalData: yearData,
+      originalData: yearData, // Pass original data to extract currency later
     };
   } catch (e) {
     console.error(
@@ -1162,9 +1162,11 @@ async function fetchMetricData(symbol, year, metric) {
 //  SERVER START
 // =========================================================================
 
+// === ADD THIS ONE ROUTE FOR UPTIMEROBOT ===
 app.get("/", (req, res) => {
   res.send("Server is online and ready.");
 });
+// ==========================================
 
 const listener = app.listen(process.env.PORT || 3000, "0.0.0.0", () => {
   const port = listener.address().port;
