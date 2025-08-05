@@ -764,7 +764,7 @@ app.get("/fetch-peers", async (req, res) => {
   const screenerCompanyMap = new Map();
   const seenCompanyNames = new Set();
 
-  [...local.Peers, ...globalPeers].forEach((c) => {
+  [...localPeers, ...globalPeers].forEach((c) => {
     if (c && c.symbol && c.companyName) {
       if (
         !screenerCompanyMap.has(c.symbol) &&
