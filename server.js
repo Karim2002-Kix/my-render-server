@@ -11,67 +11,43 @@ const apiCache = new Map();
 const CACHE_TTL_MS = 1000 * 60 * 30; // Cache data for 30 minutes
 
 // --- START: MODIFICATION ---
-// New cache for yearly average exchange rates. Key: year, Value: rates object
-const yearlyAverageRateCache = new Map();
+// New cache for exchange rates to avoid repeated API calls.
+const exchangeRateCache = new Map();
 
 /**
- * Fetches and calculates the average exchange rates for a specific year using the exchangerate.host API.
- * It samples the rate from the 15th of each month to approximate the yearly average.
- * The results are cached indefinitely.
- * @param {string|number} year The year for which to calculate average rates.
- * @returns {Promise<object>} An object containing the average rates relative to USD.
+ * Fetches and caches exchange rates to convert various currencies to USD.
+ * It fetches all rates relative to USD in a single API call.
  */
-async function getYearlyAverageUsdExchangeRates(year) {
-    if (yearlyAverageRateCache.has(year)) {
-        console.log(`[RATES-CACHE] Using cached average exchange rates for ${year}.`);
-        return yearlyAverageRateCache.get(year);
+async function getUsdExchangeRates() {
+  const cacheKey = "usd_rates";
+  const cached = exchangeRateCache.get(cacheKey);
+
+  // Use cache if it's not older than 6 hours
+  if (cached && cached.expiry > Date.now()) {
+    return cached.data;
+  }
+
+  try {
+    console.log("[RATES] Fetching latest USD exchange rates...");
+    // This API provides rates as "1 USD = X other_currency".
+    const ratesData = await fetchDataWithRetry(
+      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
+    );
+
+    if (ratesData && ratesData.usd) {
+      const rates = ratesData.usd;
+      exchangeRateCache.set(cacheKey, {
+        data: rates,
+        expiry: Date.now() + 1000 * 60 * 60 * 6, // Cache for 6 hours
+      });
+      return rates;
     }
-
-    console.log(`[RATES-AVG] Calculating average exchange rates for ${year} using exchangerate.host...`);
-
-    // Define the currencies you want to support (as uppercase symbols).
-    const currenciesToAverage = ['SAR', 'EUR', 'GBP', 'CAD', 'JPY', 'AED', 'KWD'];
-
-    const monthlyRatePromises = [];
-
-    // Create API calls for the 15th of each month.
-    for (let month = 1; month <= 12; month++) {
-        const dateString = `${year}-${String(month).padStart(2, '0')}-15`;
-        const url = `https://api.exchangerate.host/${dateString}?base=USD&symbols=${currenciesToAverage.join(',')}`;
-        monthlyRatePromises.push(fetchDataWithRetry(url).catch(e => {
-            console.warn(`[RATES-AVG] Could not fetch rates for date ${dateString}: ${e.message}`);
-            return null;
-        }));
-    }
-
-    const monthlyResults = await Promise.all(monthlyRatePromises);
-    const validMonthlyResults = monthlyResults.filter(r => r && r.success);
-
-    if (validMonthlyResults.length < 6) { // If less than half the year's data is available, fail.
-        console.error(`[RATES-AVG] Failed to fetch sufficient historical rate data for ${year}.`);
-        // Return a default object to prevent crashes, but log the error.
-        return { usd: 1.0 }; 
-    }
-
-    const averageRates = { usd: 1.0 };
-
-    for (const currency of currenciesToAverage) {
-        const validRates = validMonthlyResults
-            .map(result => result && result.rates ? result.rates[currency.toUpperCase()] : null)
-            .filter(rate => typeof rate === 'number');
-
-        if (validRates.length > 0) {
-            const sum = validRates.reduce((acc, rate) => acc + rate, 0);
-            averageRates[currency.toLowerCase()] = sum / validRates.length;
-        } else {
-            console.warn(`[RATES-AVG] Could not calculate average for ${currency} for ${year}.`);
-            averageRates[currency.toLowerCase()] = null;
-        }
-    }
-
-    yearlyAverageRateCache.set(year, averageRates);
-    console.log(`[RATES-AVG] Finished calculating averages for ${year}.`, averageRates);
-    return averageRates;
+    throw new Error("Invalid rate data structure received.");
+  } catch (error) {
+    console.error(`[RATES] Could not fetch exchange rates: ${error.message}`);
+    // Return a default object on failure to prevent crashes
+    return { usd: 1.0 };
+  }
 }
 // --- END: MODIFICATION ---
 
@@ -305,13 +281,13 @@ app.get("/fetch", async (req, res) => {
     );
 
     // --- Step 2.5: Normalize market caps to USD for accurate sorting ---
-    const rates = await getYearlyAverageUsdExchangeRates(year);
+    const rates = await getUsdExchangeRates();
     const normalizedPool = enrichedPool.map((company) => {
       const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
       const rate = rates[currency];
       if (!rate) {
         console.warn(
-          `[NORMALIZE] No average exchange rate found for ${currency.toUpperCase()} for year ${year}. Market cap for ${company.symbol} might be inaccurate for sorting.`,
+          `[NORMALIZE] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate for sorting.`,
         );
         return { ...company, marketCapUSD: company.marketCap };
       }
@@ -735,48 +711,37 @@ async function fetchBasicCompanyData(symbol, year) {
 //  ADDITIONAL ENDPOINTS (/fetch-metric, /fetch-peers)
 // =========================================================================
 
-// =========================================================================
-//  START: REPLACEMENT BLOCK FOR /fetch-metric
-// =========================================================================
 app.get("/fetch-metric", async (req, res) => {
-    const { symbols, year, metric } = req.query;
-    if (!symbols || !year || !metric) {
-        return res.status(400).json({ error: "Missing parameters" });
-    }
-
-    const symbolList = symbols.split(",");
-    const MAX_CONCURRENT = 10;
-    let results = [];
-
-    // This is the key: get the exchange rates for the requested year just ONCE.
-    const rates = await getYearlyAverageUsdExchangeRates(year);
-
-    for (let i = 0; i < symbolList.length; i += MAX_CONCURRENT) {
-        const batch = symbolList.slice(i, i + MAX_CONCURRENT);
-        // Pass the rates into the fetch function
-        const promises = batch.map(s => fetchMetricData(s, year, metric, rates));
-        results.push(...(await Promise.all(promises)));
-        if (i + MAX_CONCURRENT < symbolList.length) await delay(200);
-    }
-
-    // Now, the 'results' array contains data that has already been normalized to USD.
-    // We just need to format it for the response.
-    const finalResults = results.filter(Boolean).map(result => {
-        return {
-            symbol: result.symbol,
-            [metric]: result[metric], // This value is now in USD if it was a monetary metric
-            currency: 'USD' // We explicitly state that the returned currency is USD
-        };
+  const { symbols, year, metric } = req.query;
+  if (!symbols || !year || !metric)
+    return res.status(400).json({
+      error: "Missing parameters",
     });
 
-    res.json({
-        companies: finalResults
-    });
+  const symbolList = symbols.split(",");
+  const MAX_CONCURRENT = 10;
+  let results = [];
+  for (let i = 0; i < symbolList.length; i += MAX_CONCURRENT) {
+    const batch = symbolList.slice(i, i + MAX_CONCURRENT);
+    const promises = batch.map((s) => fetchMetricData(s, year, metric));
+    results.push(...(await Promise.all(promises)));
+    if (i + MAX_CONCURRENT < symbolList.length) await delay(200);
+  }
+
+  // Attach the reported currency to the response
+  const finalResultsWithCurrency = results.filter(Boolean).map((result) => {
+    const originalData = result.originalData || {};
+    return {
+      symbol: result.symbol,
+      [metric]: result[metric],
+      currency: getCompanyCurrency(originalData),
+    };
+  });
+
+  res.json({
+    companies: finalResultsWithCurrency,
+  });
 });
-// =========================================================================
-//  END: REPLACEMENT BLOCK FOR /fetch-metric
-// =========================================================================
-
 
 app.get("/fetch-peers", async (req, res) => {
   const { sector, year } = req.query;
@@ -825,13 +790,13 @@ app.get("/fetch-peers", async (req, res) => {
   );
 
   // Apply the same normalization logic here for accurate sorting
-  const rates = await getYearlyAverageUsdExchangeRates(year);
+  const rates = await getUsdExchangeRates();
   const normalizedPeers = verifiedPeers.map((company) => {
     const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
     const rate = rates[currency];
     if (!rate) {
       console.warn(
-        `[NORMALIZE-PEERS] No average exchange rate found for ${currency.toUpperCase()} for year ${year}. Market cap for ${company.symbol} might be inaccurate.`,
+        `[NORMALIZE-PEERS] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate.`,
       );
       return { ...company, marketCapUSD: company.marketCap };
     }
@@ -1088,159 +1053,144 @@ const fullMetricEndpointMap = {
   },
 };
 
-// =========================================================================
-//  START: REPLACEMENT BLOCK FOR fetchMetricData
-// =========================================================================
-// This helper function now checks if a metric is monetary
-function isMonetaryMetric(metric) {
-    const monetaryMetrics = [
-        'marketCap', 'enterpriseValue', 'grahamNumber', 'grahamNetNet',
-        'workingCapital', 'investedCapital', 'netCurrentAssetValue',
-        'averageReceivables', 'averagePayables', 'averageInventory',
-        'revenue', 'revenuePerShare', 'netIncomePerShare',
-        'bookValuePerShare', 'tangibleBookValuePerShare',
-        'shareholdersEquityPerShare', 'interestDebtPerShare',
-        'capexPerShare', 'operatingCashFlowPerShare', 'freeCashFlowPerShare',
-        'cashPerShare'
-    ];
-    return monetaryMetrics.includes(metric);
-}
-
-
-async function fetchMetricData(symbol, year, metric, rates) { // It now accepts 'rates'
-    // The special case for 'revenuePerFte' remains the same as it has its own logic
-    if (metric === "revenuePerFte") {
-        console.log(
-          `[METRIC] Calculating special metric 'revenuePerFte' for ${symbol}`,
-        );
-        try {
-          const [incomeStatementData, profileDataRes] = await Promise.all([
-            getCachedAnnualData(symbol, "income-statement"),
-            getCachedAnnualData(symbol, "profile"),
-          ]);
-    
-          let revenueYearData = Array.isArray(incomeStatementData)
-            ? incomeStatementData.find((d) => String(d.fiscalYear) === String(year))
-            : null;
-    
-          if (
-            !revenueYearData &&
-            Array.isArray(incomeStatementData) &&
-            incomeStatementData.length > 0
-          ) {
-            console.warn(
-              `[METRIC-FALLBACK] No revenue for year ${year} for ${symbol}. Using most recent available.`,
-            );
-            incomeStatementData.sort(
-              (a, b) => parseInt(b.fiscalYear) - parseInt(a.fiscalYear),
-            );
-            revenueYearData = incomeStatementData[0];
-          }
-    
-          const profileData = Array.isArray(profileDataRes)
-            ? profileDataRes[0]
-            : null;
-    
-          if (
-            revenueYearData &&
-            revenueYearData.revenue != null &&
-            profileData &&
-            profileData.fullTimeEmployees > 0
-          ) {
-            const revenue = revenueYearData.revenue;
-            const employees = parseInt(profileData.fullTimeEmployees, 10);
-    
-            if (isNaN(employees) || employees <= 0) {
-              console.warn(
-                `[METRIC] Invalid employee count for ${symbol}: '${profileData.fullTimeEmployees}'`,
-              );
-              return { symbol, [metric]: "N/A" };
-            }
-            
-            // This is a special case. We will normalize it here as well.
-            let calculatedValue = revenue / employees;
-            const originalCurrency = getCompanyCurrency(revenueYearData).toLowerCase();
-            if (originalCurrency !== 'usd') {
-                const conversionRate = rates[originalCurrency];
-                if(conversionRate) {
-                    calculatedValue = calculatedValue / conversionRate;
-                } else {
-                    calculatedValue = 'N/A';
-                }
-            }
-            return { symbol, [metric]: calculatedValue };
-          } else {
-            let reason = "Required data not available.";
-            if (!revenueYearData || revenueYearData.revenue == null) {
-              reason = `Revenue for year ${year} (or fallback) not found.`;
-            } else if (!profileData || !profileData.fullTimeEmployees) {
-              reason = "Full Time Employees not found in company profile.";
-            } else if (parseInt(profileData.fullTimeEmployees, 10) <= 0) {
-              reason = "Full Time Employees is zero or invalid in profile.";
-            }
-            console.warn(
-              `[METRIC] Could not calculate 'revenuePerFte' for ${symbol}. Reason: ${reason}`,
-            );
-            return { symbol, [metric]: "N/A" };
-          }
-        } catch (e) {
-          console.error(
-            `[METRIC] Unhandled exception fetching data for 'revenuePerFte' for ${symbol}: ${e.message}`,
-          );
-          return { symbol, [metric]: "N/A" };
-        }
-    }
-
-    const info = fullMetricEndpointMap[metric];
-    if (!info) {
-        console.warn(`[METRIC] No mapping found for metric: ${metric}`);
-        return null;
-    }
-
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+/**
+ * Fetches a specific metric for a company, using the cache.
+ */
+async function fetchMetricData(symbol, year, metric) {
+  // START: REVISED SPECIAL CASE FOR 'Revenue per FTE'
+  if (metric === "revenuePerFte") {
+    console.log(
+      `[METRIC] Calculating special metric 'revenuePerFte' for ${symbol}`,
+    );
     try {
-        const endpointData = await getCachedAnnualData(symbol, info.endpoint);
-        const yearData = Array.isArray(endpointData) ? endpointData.find(d => String(d.fiscalYear) === String(year)) : null;
+      // We need data from two different sources. Let's fetch them in parallel.
+      const [incomeStatementData, profileDataRes] = await Promise.all([
+        getCachedAnnualData(symbol, "income-statement"), // Gets historical revenue
+        getCachedAnnualData(symbol, "profile"), // Gets latest employee count
+      ]);
 
-        if (!yearData || yearData[info.field] == null) {
-            return { symbol, [metric]: 'N/A' };
+      // --- Step 1: Process the Income Statement to get Revenue ---
+      // Use fallback logic to find the most recent revenue data if the exact year is missing.
+      let revenueYearData = Array.isArray(incomeStatementData)
+        ? incomeStatementData.find((d) => String(d.fiscalYear) === String(year))
+        : null;
+
+      if (
+        !revenueYearData &&
+        Array.isArray(incomeStatementData) &&
+        incomeStatementData.length > 0
+      ) {
+        console.warn(
+          `[METRIC-FALLBACK] No revenue for year ${year} for ${symbol}. Using most recent available.`,
+        );
+        incomeStatementData.sort(
+          (a, b) => parseInt(b.fiscalYear) - parseInt(a.fiscalYear),
+        );
+        revenueYearData = incomeStatementData[0]; // Use the most recent one (e.g., 2023)
+      }
+
+      // --- Step 2: Process the Profile to get Full Time Employees ---
+      // The profile endpoint returns an array with one object.
+      const profileData = Array.isArray(profileDataRes)
+        ? profileDataRes[0]
+        : null;
+
+      // --- Step 3: Perform the calculation ---
+      // Check if we have everything we need from both sources.
+      if (
+        revenueYearData &&
+        revenueYearData.revenue != null &&
+        profileData &&
+        profileData.fullTimeEmployees > 0
+      ) {
+        // The 'fullTimeEmployees' from the profile can be a string, so we must parse it.
+        const revenue = revenueYearData.revenue;
+        const employees = parseInt(profileData.fullTimeEmployees, 10);
+
+        if (isNaN(employees) || employees <= 0) {
+          console.warn(
+            `[METRIC] Invalid employee count for ${symbol}: '${profileData.fullTimeEmployees}'`,
+          );
+          return { symbol, [metric]: "N/A", originalData: revenueYearData };
         }
 
-        let finalValue = yearData[info.field];
-
-        // +++ THIS IS THE NORMALIZATION LOGIC WE ARE ADDING +++
-        // Check if the metric is monetary and needs conversion
-        if (isMonetaryMetric(metric)) {
-            const originalCurrency = getCompanyCurrency(yearData).toLowerCase();
-            if (originalCurrency !== 'usd') {
-                const conversionRate = rates[originalCurrency];
-                if (conversionRate) {
-                    // Divide to convert the foreign currency value TO USD
-                    finalValue = finalValue / conversionRate;
-                } else {
-                    console.warn(`[METRIC-CONVERT] No rate for ${originalCurrency.toUpperCase()}, cannot convert ${metric} for ${symbol}.`);
-                    finalValue = 'N/A';
-                }
-            }
-        }
-        // +++ END OF NEW LOGIC +++
+        console.log(
+          `[METRIC-CALC] ${symbol}: Revenue (from FY${revenueYearData.fiscalYear}) = ${revenue}, Employees = ${employees}`,
+        );
+        const calculatedValue = revenue / employees;
 
         return {
-            symbol,
-            [metric]: finalValue // This is now the USD-normalized value
+          symbol,
+          [metric]: calculatedValue,
+          // The income statement data is the one with the financial currency.
+          originalData: revenueYearData,
         };
-
+      } else {
+        // Log a more detailed reason why the calculation failed.
+        let reason = "Required data not available.";
+        if (!revenueYearData || revenueYearData.revenue == null) {
+          reason = `Revenue for year ${year} (or fallback) not found.`;
+        } else if (!profileData || !profileData.fullTimeEmployees) {
+          reason = "Full Time Employees not found in company profile.";
+        } else if (parseInt(profileData.fullTimeEmployees, 10) <= 0) {
+          reason = "Full Time Employees is zero or invalid in profile.";
+        }
+        console.warn(
+          `[METRIC] Could not calculate 'revenuePerFte' for ${symbol}. Reason: ${reason}`,
+        );
+        return {
+          symbol,
+          [metric]: "N/A",
+          originalData: revenueYearData || profileData,
+        };
+      }
     } catch (e) {
-        console.error(`[METRIC] Failed to fetch ${metric} for ${symbol}: ${e.message}`);
-        return {
-            symbol,
-            [metric]: 'N/A'
-        };
+      console.error(
+        `[METRIC] Unhandled exception fetching data for 'revenuePerFte' for ${symbol}: ${e.message}`,
+      );
+      return { symbol, [metric]: "N/A" };
     }
-}
-// =========================================================================
-//  END: REPLACEMENT BLOCK FOR fetchMetricData
-// =========================================================================
+  }
+  // END: REVISED SPECIAL CASE
 
+  // --- The rest of the function for all other metrics remains the same ---
+  const info = fullMetricEndpointMap[metric];
+  if (!info) {
+    console.warn(`[METRIC] No mapping found for metric: ${metric}`);
+    return null;
+  }
+
+  try {
+    const endpointData = await getCachedAnnualData(symbol, info.endpoint);
+    const yearData = Array.isArray(endpointData)
+      ? endpointData.find((d) => String(d.fiscalYear) === String(year))
+      : null;
+
+    return {
+      symbol,
+      [metric]:
+        yearData && yearData[info.field] != null ? yearData[info.field] : "N/A",
+      originalData: yearData, // Pass original data to extract currency later
+    };
+  } catch (e) {
+    console.error(
+      `[METRIC] Failed to fetch ${metric} for ${symbol}: ${e.message}`,
+    );
+    return {
+      symbol,
+      [metric]: "N/A",
+    };
+  }
+}
 
 // =========================================================================
 //  SERVER START
