@@ -331,7 +331,7 @@ app.get("/fetch", async (req, res) => {
       `[FETCH] Data enrichment complete. Have valid data for ${enrichedPool.length} companies.`,
     );
 
-    const rates = await getUsdExchangeRates();
+    const rates = await getTrueAverageRates(year);
     const normalizedPool = enrichedPool.map((company) => {
       const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
       const rate = rates[currency];
@@ -788,7 +788,7 @@ app.get("/fetch-peers", async (req, res) => {
     500,
   );
 
-  const rates = await getUsdExchangeRates();
+  const rates = await getTrueAverageRates(year);
   const normalizedPeers = verifiedPeers.map((company) => {
     const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
     const rate = rates[currency];
