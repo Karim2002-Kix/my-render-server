@@ -21,18 +21,21 @@ const exchangeRateCache = new Map();
 async function getUsdExchangeRates() {
   const cacheKey = "usd_rates";
   const cached = exchangeRateCache.get(cacheKey);
+
   // Use cache if it's not older than 6 hours
   if (cached && cached.expiry > Date.now()) {
     return cached.data;
   }
+
   try {
     console.log("[RATES] Fetching latest USD exchange rates...");
     // This API provides rates as "1 USD = X other_currency".
     const ratesData = await fetchDataWithRetry(
-      "https://v6.exchangerate-api.com/v6/c657063f699b1569b025210f/latest/USD"
+      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
     );
-    if (ratesData && ratesData.conversion_rates) {
-      const rates = ratesData.conversion_rates;
+
+    if (ratesData && ratesData.usd) {
+      const rates = ratesData.usd;
       exchangeRateCache.set(cacheKey, {
         data: rates,
         expiry: Date.now() + 1000 * 60 * 60 * 6, // Cache for 6 hours
@@ -43,7 +46,7 @@ async function getUsdExchangeRates() {
   } catch (error) {
     console.error(`[RATES] Could not fetch exchange rates: ${error.message}`);
     // Return a default object on failure to prevent crashes
-    return { USD: 1.0 };
+    return { usd: 1.0 };
   }
 }
 // --- END: MODIFICATION ---
@@ -519,31 +522,47 @@ async function getFullScreenerList(code, year) {
 /**
  * Enriches companies with historical market cap data with robust fallbacks.
  */
-async function enrichCompaniesWithHistoricalMarketCap(companies, year, batchSize, delayMs) {
+async function enrichCompaniesWithHistoricalMarketCap(
+  companies,
+  year,
+  batchSize,
+  delayMs,
+) {
   const enrichedCompanies = [];
-  const rates = await getUsdExchangeRates(); // Fetch exchange rates
-
   for (let i = 0; i < companies.length; i += batchSize) {
     const batchCompanies = companies.slice(i, i + batchSize);
-    console.log(`[ENRICH] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(companies.length / batchSize)}...`);
+    console.log(
+      `[ENRICH] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(companies.length / batchSize)}...`,
+    );
+
     const batchPromises = batchCompanies.map(async (company) => {
       // Fetch all potential data sources at once for efficiency
       const [evRes, metricsRes, profileRes] = await Promise.all([
-        getCachedAnnualData(company.symbol, 'enterprise-values'),
-        getCachedAnnualData(company.symbol, 'key-metrics'),
-        getCachedAnnualData(company.symbol, 'profile')
+        getCachedAnnualData(company.symbol, "enterprise-values"),
+        getCachedAnnualData(company.symbol, "key-metrics"),
+        getCachedAnnualData(company.symbol, "profile"),
       ]);
 
       // Find the data for the specific year from each source
-      const evData = Array.isArray(evRes) ? evRes.find(ev => ev.date && String(ev.date).startsWith(String(year))) : null;
-      const metricsData = Array.isArray(metricsRes) ? metricsRes.find(m => String(m.fiscalYear) === String(year)) : null;
+      const evData = Array.isArray(evRes)
+        ? evRes.find(
+            (ev) => ev.date && String(ev.date).startsWith(String(year)),
+          )
+        : null;
+      const metricsData = Array.isArray(metricsRes)
+        ? metricsRes.find((m) => String(m.fiscalYear) === String(year))
+        : null;
       const profileData = Array.isArray(profileRes) ? profileRes[0] : null;
 
       // If we don't have basic profile info, we can't proceed.
       if (!profileData) {
-        console.warn(`[ENRICH] ${company.symbol}: No profile data found. It will be excluded.`);
+        console.warn(
+          `[ENRICH] ${company.symbol}: No profile data found. It will be excluded.`,
+        );
         return null;
       }
+
+      // --- START: CORRECTED LOGIC ---
 
       // Step 1: Reliably determine the FINANCIAL currency. Prioritize key-metrics.
       let financialCurrency;
@@ -552,7 +571,9 @@ async function enrichCompaniesWithHistoricalMarketCap(companies, year, batchSize
       } else {
         // Fallback to profile currency if key-metrics is unavailable. This is less reliable.
         financialCurrency = getCompanyCurrency(profileData);
-        console.warn(`[ENRICH-CURRENCY] ${company.symbol}: Using profile currency '${financialCurrency}' as fallback.`);
+        console.warn(
+          `[ENRICH-CURRENCY] ${company.symbol}: Using profile currency '${financialCurrency}' as fallback.`,
+        );
       }
 
       // Step 2: Determine the best market cap value, prioritizing the new endpoint.
@@ -562,37 +583,42 @@ async function enrichCompaniesWithHistoricalMarketCap(companies, year, batchSize
         marketCapValue = evData.marketCapitalization;
       } else if (metricsData && metricsData.marketCap > 0) {
         // First fallback: /key-metrics
-        console.warn(`[ENRICH-FALLBACK] ${company.symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`);
+        console.warn(
+          `[ENRICH-FALLBACK] ${company.symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`,
+        );
         marketCapValue = metricsData.marketCap;
       } else if (profileData && profileData.mktCap > 0) {
         // Final fallback: live data from /profile
-        console.warn(`[ENRICH-FALLBACK] ${company.symbol}: No historical data, using LIVE 'profile' market cap.`);
+        console.warn(
+          `[ENRICH-FALLBACK] ${company.symbol}: No historical data, using LIVE 'profile' market cap.`,
+        );
         marketCapValue = profileData.mktCap;
       }
 
       // Step 3: If we found a valid market cap, build and return the company object.
       if (marketCapValue > 0) {
-        // Convert market cap to USD using exchange rates
-        const currency = financialCurrency.toLowerCase();
-        const rate = rates[currency];
-        let marketCapUSD = marketCapValue;
-        if (currency !== 'usd' && rate) {
-          marketCapUSD = marketCapValue / rate;
-        }
-
-        company.marketCap = marketCapUSD;
-        company.currency = financialCurrency;
+        company.marketCap = marketCapValue;
+        company.currency = financialCurrency; // Use the CORRECT financial currency
         company.companyName = profileData.companyName || company.companyName;
         company.sector = profileData.sector || company.sector;
-        company.industry = getStandardizedIndustry(profileData.industry) || company.industry;
+        company.industry =
+          getStandardizedIndustry(profileData.industry) || company.industry;
         company.country = profileData.country || company.country;
+
+        // --- START: NEW DUPLICATE HANDLING ---
+        // Add the required fields for our de-duplication logic later.
         company.isActivelyTrading = profileData.isActivelyTrading;
         company.ipoDate = profileData.ipoDate;
+        // --- END: NEW DUPLICATE HANDLING ---
 
         return company;
       }
 
-      console.warn(`[ENRICH] ${company.symbol}: Could not find any valid market cap for year ${year}. It will be excluded.`);
+      // --- END: CORRECTED LOGIC ---
+
+      console.warn(
+        `[ENRICH] ${company.symbol}: Could not find any valid market cap for year ${year}. It will be excluded.`,
+      );
       return null;
     });
 
@@ -600,31 +626,34 @@ async function enrichCompaniesWithHistoricalMarketCap(companies, year, batchSize
     enrichedCompanies.push(...batchResults.filter(Boolean));
     if (i + batchSize < companies.length) await delay(delayMs);
   }
-
-  return enrichedCompanies.filter(c => c && typeof c.marketCap === 'number' && c.marketCap > 0);
+  return enrichedCompanies.filter(
+    (c) => c && typeof c.marketCap === "number" && c.marketCap > 0,
+  );
 }
-
 
 /**
  * Fetches the definitive annual data for a single company using the cache.
  */
 async function fetchBasicCompanyData(symbol, year) {
   if (!symbol) return null;
-
-  const rates = await getUsdExchangeRates(); // Fetch exchange rates
-
   try {
     const [evRes, metricsRes, profileRes] = await Promise.all([
-      getCachedAnnualData(symbol, 'enterprise-values'),
-      getCachedAnnualData(symbol, 'key-metrics'),
-      getCachedAnnualData(symbol, 'profile')
+      getCachedAnnualData(symbol, "enterprise-values"),
+      getCachedAnnualData(symbol, "key-metrics"),
+      getCachedAnnualData(symbol, "profile"),
     ]);
 
     const profileData = Array.isArray(profileRes) ? profileRes[0] : null;
     if (!profileData) return null;
 
-    const evData = Array.isArray(evRes) ? evRes.find(ev => ev.date && String(ev.date).startsWith(String(year))) : null;
-    const metricsData = Array.isArray(metricsRes) ? metricsRes.find(m => String(m.fiscalYear) === String(year)) : null;
+    const evData = Array.isArray(evRes)
+      ? evRes.find((ev) => ev.date && String(ev.date).startsWith(String(year)))
+      : null;
+    const metricsData = Array.isArray(metricsRes)
+      ? metricsRes.find((m) => String(m.fiscalYear) === String(year))
+      : null;
+
+    // --- START: CORRECTED LOGIC ---
 
     // Step 1: Reliably determine financial currency from key-metrics
     let financialCurrency;
@@ -632,7 +661,9 @@ async function fetchBasicCompanyData(symbol, year) {
       financialCurrency = metricsData.reportedCurrency;
     } else {
       financialCurrency = getCompanyCurrency(profileData);
-      console.warn(`[DATA-CURRENCY] ${symbol}: Using profile currency '${financialCurrency}' as fallback.`);
+      console.warn(
+        `[DATA-CURRENCY] ${symbol}: Using profile currency '${financialCurrency}' as fallback.`,
+      );
     }
 
     // Step 2: Determine market cap value with proper fallbacks
@@ -640,38 +671,41 @@ async function fetchBasicCompanyData(symbol, year) {
     if (evData && evData.marketCapitalization > 0) {
       marketCapValue = evData.marketCapitalization;
     } else if (metricsData && metricsData.marketCap > 0) {
-      console.warn(`[DATA-FALLBACK] ${symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`);
+      console.warn(
+        `[DATA-FALLBACK] ${symbol}: No 'enterprise-values' data, using 'key-metrics' market cap.`,
+      );
       marketCapValue = metricsData.marketCap;
     } else if (profileData && profileData.mktCap > 0) {
-      console.warn(`[DATA-FALLBACK] ${symbol}: No historical data, using LIVE 'profile' market cap.`);
+      console.warn(
+        `[DATA-FALLBACK] ${symbol}: No historical data, using LIVE 'profile' market cap.`,
+      );
       marketCapValue = profileData.mktCap;
     }
 
-    // Convert market cap to USD using exchange rates
-    const currency = financialCurrency.toLowerCase();
-    const rate = rates[currency];
-    let marketCapUSD = marketCapValue;
-    if (currency !== 'usd' && rate) {
-      marketCapUSD = marketCapValue / rate;
-    }
+    // --- END: CORRECTED LOGIC ---
 
     return {
       symbol: profileData.symbol,
       companyName: profileData.companyName,
-      marketCap: marketCapUSD,
+      marketCap: marketCapValue,
       sector: profileData.sector,
       industry: getStandardizedIndustry(profileData.industry),
       country: profileData.country,
-      currency: financialCurrency,
+      currency: financialCurrency, // Use the CORRECT financial currency
+
+      // --- START: NEW DUPLICATE HANDLING ---
+      // Add the required fields for our de-duplication logic later.
       isActivelyTrading: profileData.isActivelyTrading,
-      ipoDate: profileData.ipoDate
+      ipoDate: profileData.ipoDate,
+      // --- END: NEW DUPLICATE HANDLING ---
     };
   } catch (e) {
-    console.error(`[DATA] Error fetching basic data for ${symbol}: ${e.message}`);
+    console.error(
+      `[DATA] Error fetching basic data for ${symbol}: ${e.message}`,
+    );
     return null;
   }
 }
-
 
 // =========================================================================
 //  ADDITIONAL ENDPOINTS (/fetch-metric, /fetch-peers)
