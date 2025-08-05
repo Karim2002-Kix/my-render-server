@@ -11,43 +11,67 @@ const apiCache = new Map();
 const CACHE_TTL_MS = 1000 * 60 * 30; // Cache data for 30 minutes
 
 // --- START: MODIFICATION ---
-// New cache for exchange rates to avoid repeated API calls.
-const exchangeRateCache = new Map();
+// New cache for yearly average exchange rates. Key: year, Value: rates object
+const yearlyAverageRateCache = new Map();
 
 /**
- * Fetches and caches exchange rates to convert various currencies to USD.
- * It fetches all rates relative to USD in a single API call.
+ * Fetches and calculates the average exchange rates for a specific year using the exchangerate.host API.
+ * It samples the rate from the 15th of each month to approximate the yearly average.
+ * The results are cached indefinitely.
+ * @param {string|number} year The year for which to calculate average rates.
+ * @returns {Promise<object>} An object containing the average rates relative to USD.
  */
-async function getUsdExchangeRates() {
-  const cacheKey = "usd_rates";
-  const cached = exchangeRateCache.get(cacheKey);
-
-  // Use cache if it's not older than 6 hours
-  if (cached && cached.expiry > Date.now()) {
-    return cached.data;
-  }
-
-  try {
-    console.log("[RATES] Fetching latest USD exchange rates...");
-    // This API provides rates as "1 USD = X other_currency".
-    const ratesData = await fetchDataWithRetry(
-      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-    );
-
-    if (ratesData && ratesData.usd) {
-      const rates = ratesData.usd;
-      exchangeRateCache.set(cacheKey, {
-        data: rates,
-        expiry: Date.now() + 1000 * 60 * 60 * 6, // Cache for 6 hours
-      });
-      return rates;
+async function getYearlyAverageUsdExchangeRates(year) {
+    if (yearlyAverageRateCache.has(year)) {
+        console.log(`[RATES-CACHE] Using cached average exchange rates for ${year}.`);
+        return yearlyAverageRateCache.get(year);
     }
-    throw new Error("Invalid rate data structure received.");
-  } catch (error) {
-    console.error(`[RATES] Could not fetch exchange rates: ${error.message}`);
-    // Return a default object on failure to prevent crashes
-    return { usd: 1.0 };
-  }
+
+    console.log(`[RATES-AVG] Calculating average exchange rates for ${year} using exchangerate.host...`);
+
+    // Define the currencies you want to support (as uppercase symbols).
+    const currenciesToAverage = ['SAR', 'EUR', 'GBP', 'CAD', 'JPY', 'AED', 'KWD'];
+
+    const monthlyRatePromises = [];
+
+    // Create API calls for the 15th of each month.
+    for (let month = 1; month <= 12; month++) {
+        const dateString = `${year}-${String(month).padStart(2, '0')}-15`;
+        const url = `https://api.exchangerate.host/${dateString}?base=USD&symbols=${currenciesToAverage.join(',')}`;
+        monthlyRatePromises.push(fetchDataWithRetry(url).catch(e => {
+            console.warn(`[RATES-AVG] Could not fetch rates for date ${dateString}: ${e.message}`);
+            return null;
+        }));
+    }
+
+    const monthlyResults = await Promise.all(monthlyRatePromises);
+    const validMonthlyResults = monthlyResults.filter(r => r && r.success);
+
+    if (validMonthlyResults.length < 6) { // If less than half the year's data is available, fail.
+        console.error(`[RATES-AVG] Failed to fetch sufficient historical rate data for ${year}.`);
+        // Return a default object to prevent crashes, but log the error.
+        return { usd: 1.0 }; 
+    }
+
+    const averageRates = { usd: 1.0 };
+
+    for (const currency of currenciesToAverage) {
+        const validRates = validMonthlyResults
+            .map(result => result && result.rates ? result.rates[currency.toUpperCase()] : null)
+            .filter(rate => typeof rate === 'number');
+
+        if (validRates.length > 0) {
+            const sum = validRates.reduce((acc, rate) => acc + rate, 0);
+            averageRates[currency.toLowerCase()] = sum / validRates.length;
+        } else {
+            console.warn(`[RATES-AVG] Could not calculate average for ${currency} for ${year}.`);
+            averageRates[currency.toLowerCase()] = null;
+        }
+    }
+
+    yearlyAverageRateCache.set(year, averageRates);
+    console.log(`[RATES-AVG] Finished calculating averages for ${year}.`, averageRates);
+    return averageRates;
 }
 // --- END: MODIFICATION ---
 
@@ -281,13 +305,13 @@ app.get("/fetch", async (req, res) => {
     );
 
     // --- Step 2.5: Normalize market caps to USD for accurate sorting ---
-    const rates = await getUsdExchangeRates();
+    const rates = await getYearlyAverageUsdExchangeRates(year);
     const normalizedPool = enrichedPool.map((company) => {
       const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
       const rate = rates[currency];
       if (!rate) {
         console.warn(
-          `[NORMALIZE] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate for sorting.`,
+          `[NORMALIZE] No average exchange rate found for ${currency.toUpperCase()} for year ${year}. Market cap for ${company.symbol} might be inaccurate for sorting.`,
         );
         return { ...company, marketCapUSD: company.marketCap };
       }
@@ -790,13 +814,13 @@ app.get("/fetch-peers", async (req, res) => {
   );
 
   // Apply the same normalization logic here for accurate sorting
-  const rates = await getUsdExchangeRates();
+  const rates = await getYearlyAverageUsdExchangeRates(year);
   const normalizedPeers = verifiedPeers.map((company) => {
     const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
     const rate = rates[currency];
     if (!rate) {
       console.warn(
-        `[NORMALIZE-PEERS] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate.`,
+        `[NORMALIZE-PEERS] No average exchange rate found for ${currency.toUpperCase()} for year ${year}. Market cap for ${company.symbol} might be inaccurate.`,
       );
       return { ...company, marketCapUSD: company.marketCap };
     }
