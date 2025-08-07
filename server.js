@@ -18,37 +18,89 @@ const exchangeRateCache = new Map();
  * Fetches and caches exchange rates to convert various currencies to USD.
  * It fetches all rates relative to USD in a single API call.
  */
-async function getUsdExchangeRates() {
-  const cacheKey = "usd_rates";
-  const cached = exchangeRateCache.get(cacheKey);
+// --- START: MODIFICATION FOR HISTORICAL RATES ---
 
-  // Use cache if it's not older than 6 hours
-  if (cached && cached.expiry > Date.now()) {
-    return cached.data;
-  }
+// Cache for historical average exchange rates to avoid repeated calculations.
+const historicalRateCache = new Map();
 
-  try {
-    console.log("[RATES] Fetching latest USD exchange rates...");
-    // This API provides rates as "1 USD = X other_currency".
-    const ratesData = await fetchDataWithRetry(
-      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-    );
-
-    if (ratesData && ratesData.usd) {
-      const rates = ratesData.usd;
-      exchangeRateCache.set(cacheKey, {
-        data: rates,
-        expiry: Date.now() + 1000 * 60 * 60 * 6, // Cache for 6 hours
-      });
-      return rates;
+/**
+ * Fetches the historical exchange rate for a specific date from FMP.
+ * @param {string} currencyPair - e.g., 'EURUSD', 'SARUSD'
+ * @param {string} date - e.g., '2023-01-15'
+ * @returns {Promise<number|null>} The closing price for that day or null.
+ */
+async function fetchRateForDate(currencyPair, date) {
+    // Note: You need to use the correct endpoint for forex.
+    // The endpoint should be for the currency pair, e.g., EURUSD, not a stock symbol.
+    const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${currencyPair}?from=${date}&to=${date}&apikey=${API_KEY}`;
+    try {
+        const data = await fetchDataWithRetry(url);
+        // The API returns a 'historical' array.
+        if (data && data.historical && data.historical.length > 0) {
+            return data.historical[0].close;
+        }
+        console.warn(`[HISTORICAL-RATE] No data found for ${currencyPair} on ${date}.`);
+        return null;
+    } catch (error) {
+        console.error(`[HISTORICAL-RATE] Error fetching rate for ${currencyPair} on ${date}: ${error.message}`);
+        return null;
     }
-    throw new Error("Invalid rate data structure received.");
-  } catch (error) {
-    console.error(`[RATES] Could not fetch exchange rates: ${error.message}`);
-    // Return a default object on failure to prevent crashes
-    return { usd: 1.0 };
-  }
 }
+
+/**
+ * Calculates and caches the average exchange rate for a given year.
+ * It fetches the rate from the 15th of each month and averages the results.
+ * @param {string} fromCurrency - The currency to convert FROM (e.g., 'SAR')
+ * @param {string} toCurrency - The currency to convert TO (e.g., 'USD')
+ * @param {string} year - The year for the average calculation.
+ * @returns {Promise<number|null>} The average exchange rate or null.
+ */
+async function getHistoricalAverageRate(fromCurrency, toCurrency, year) {
+    if (fromCurrency === toCurrency) {
+        return 1.0;
+    }
+
+    const currencyPair = `${fromCurrency}${toCurrency}`;
+    const cacheKey = `${currencyPair}-${year}`;
+    const cached = historicalRateCache.get(cacheKey);
+
+    if (cached) {
+        return cached;
+    }
+
+    console.log(`[HISTORICAL-RATE] Calculating average rate for ${currencyPair} for year ${year}...`);
+
+    const monthPromises = [];
+    for (let month = 1; month <= 12; month++) {
+        // Format the date to YYYY-MM-DD
+        const date = `${year}-${String(month).padStart(2, '0')}-15`;
+        monthPromises.push(fetchRateForDate(currencyPair, date));
+    }
+
+    try {
+        const monthlyRates = await Promise.all(monthPromises);
+        const validRates = monthlyRates.filter(rate => rate !== null && typeof rate === 'number' && rate > 0);
+
+        if (validRates.length < 6) { // Require at least 6 months of data for a reliable average
+            console.warn(`[HISTORICAL-RATE] Insufficient data for ${currencyPair} in ${year}. Found only ${validRates.length} valid monthly rates. Cannot calculate average.`);
+            historicalRateCache.set(cacheKey, null); // Cache the failure
+            return null;
+        }
+
+        const sum = validRates.reduce((acc, rate) => acc + rate, 0);
+        const averageRate = sum / validRates.length;
+
+        console.log(`[HISTORICAL-RATE] Average for ${currencyPair} in ${year} is ${averageRate} based on ${validRates.length} data points.`);
+        historicalRateCache.set(cacheKey, averageRate);
+        return averageRate;
+
+    } catch (error) {
+        console.error(`[HISTORICAL-RATE] Failed to calculate average for ${currencyPair} in ${year}:`, error);
+        return null;
+    }
+}
+
+// --- END: MODIFICATION FOR HISTORICAL RATES ---
 // --- END: MODIFICATION ---
 
 // --- CORE HELPER FUNCTIONS ---
@@ -281,27 +333,32 @@ app.get("/fetch", async (req, res) => {
     );
 
     // --- Step 2.5: Normalize market caps to USD for accurate sorting ---
-    const rates = await getUsdExchangeRates();
-    const normalizedPool = enrichedPool.map((company) => {
-      const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
-      const rate = rates[currency];
-      if (!rate) {
-        console.warn(
-          `[NORMALIZE] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate for sorting.`,
-        );
-        return { ...company, marketCapUSD: company.marketCap };
-      }
-      const marketCapUSD = (company.marketCap || 0) / rate;
-      return {
-        ...company,
-        marketCapUSD,
-      };
-    });
+    // --- Step 2.5: Normalize market caps to USD for accurate sorting using HISTORICAL rates ---
+const normalizedPool = [];
+for (const company of enrichedPool) {
+    const currency = getCompanyCurrency(company) || "USD";
+    
+    // We need to convert the company's currency to USD
+    const rate = await getHistoricalAverageRate(currency, 'USD', year);
 
-    // --- Step 3: Sort the enriched list using the USD-normalized market cap ---
-    const sortedVerifiedPool = normalizedPool.sort(
-      (a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0),
-    );
+    if (rate === null) {
+        console.warn(
+          `[NORMALIZE] Could not get historical average rate for ${currency.toUpperCase()}-USD for year ${year}. Company ${company.symbol} will be excluded from sorting.`
+        );
+        // We push it without marketCapUSD so it can be filtered out later if needed
+        normalizedPool.push({ ...company, marketCapUSD: null });
+        continue;
+    }
+    
+    const marketCapUSD = (company.marketCap || 0) * rate;
+    normalizedPool.push({ ...company, marketCapUSD });
+}
+
+
+// --- Step 3: Sort the enriched list using the USD-normalized market cap ---
+const sortedVerifiedPool = normalizedPool
+    .filter(c => c.marketCapUSD !== null) // Ensure we only sort companies with a valid converted market cap
+    .sort((a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0));
 
     // --- START: NEW DUPLICATE HANDLING ---
     // Apply the de-duplication logic to the entire pool of companies
@@ -743,6 +800,7 @@ app.get("/fetch-metric", async (req, res) => {
   });
 });
 
+// This is the correct, complete endpoint. Use it to replace the entire old one.
 app.get("/fetch-peers", async (req, res) => {
   const { sector, year } = req.query;
   if (!sector || !year)
@@ -789,24 +847,83 @@ app.get("/fetch-peers", async (req, res) => {
     500,
   );
 
-  // Apply the same normalization logic here for accurate sorting
-  const rates = await getUsdExchangeRates();
-  const normalizedPeers = verifiedPeers.map((company) => {
-    const currency = (getCompanyCurrency(company) || "USD").toLowerCase();
-    const rate = rates[currency];
-    if (!rate) {
-      console.warn(
-        `[NORMALIZE-PEERS] No exchange rate found for ${currency.toUpperCase()}. Market cap for ${company.symbol} might be inaccurate.`,
-      );
-      return { ...company, marketCapUSD: company.marketCap };
-    }
-    const marketCapUSD = (company.marketCap || 0) / rate;
-    return { ...company, marketCapUSD };
-  });
+  // Apply the same HISTORICAL normalization logic here for accurate sorting
+  const normalizedPeers = [];
+  for (const company of verifiedPeers) {
+      const currency = getCompanyCurrency(company) || "USD";
+      const rate = await getHistoricalAverageRate(currency, 'USD', year);
+      
+      if (rate === null) {
+          console.warn(`[NORMALIZE-PEERS] No historical rate for ${currency.toUpperCase()}-USD for year ${year}. Excluding ${company.symbol}.`);
+          continue;
+      }
+      
+      const marketCapUSD = (company.marketCap || 0) * rate;
+      normalizedPeers.push({ ...company, marketCapUSD });
+  }
 
-  const sorted = normalizedPeers.sort(
-    (a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0),
-  );
+  const sorted = normalizedPeers
+      .sort((a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0));
+
+
+  // --- START: NEW DUPLICATE HANDLING ---
+  // Also apply de-duplication here for consistency
+  const deduplicatedPeers = deduplicateCompanies(sorted);
+  // --- END: NEW DUPLICATE HANDLING ---
+
+  const allCompaniesResponse = deduplicatedPeers.map((c) => ({
+    ...c,
+    isUserCompany: false,
+  }));
+
+  res.json({
+    allCompanies: allCompaniesResponse,
+    topCompanies: allCompaniesResponse.slice(0, 10),
+    comparisonCompanies: allCompaniesResponse.slice(0, 20),
+  });
+});
+
+  // ==================== START: REPLACEMENT AREA ====================
+  // REPLACE THE OLD CODE BLOCK WITH THIS NEW ONE
+  // ===============================================================
+
+  // Apply the same HISTORICAL normalization logic here for accurate sorting
+  const normalizedPeers = [];
+  for (const company of verifiedPeers) {
+      const currency = getCompanyCurrency(company) || "USD";
+      const rate = await getHistoricalAverageRate(currency, 'USD', year);
+      
+      if (rate === null) {
+          console.warn(`[NORMALIZE-PEERS] No historical rate for ${currency.toUpperCase()}-USD for year ${year}. Excluding ${company.symbol}.`);
+          continue;
+      }
+      
+      const marketCapUSD = (company.marketCap || 0) * rate;
+      normalizedPeers.push({ ...company, marketCapUSD });
+  }
+
+  const sorted = normalizedPeers
+      .sort((a, b) => (b.marketCapUSD || 0) - (a.marketCapUSD || 0));
+
+  // ==================== END: REPLACEMENT AREA ====================
+
+
+  // --- START: NEW DUPLICATE HANDLING ---
+  // Also apply de-duplication here for consistency
+  const deduplicatedPeers = deduplicateCompanies(sorted);
+  // --- END: NEW DUPLICATE HANDLING ---
+
+  const allCompaniesResponse = deduplicatedPeers.map((c) => ({
+    ...c,
+    isUserCompany: false,
+  }));
+
+  res.json({
+    allCompanies: allCompaniesResponse,
+    topCompanies: allCompaniesResponse.slice(0, 10),
+    comparisonCompanies: allCompaniesResponse.slice(0, 20),
+  });
+});
 
   // --- START: NEW DUPLICATE HANDLING ---
   // Also apply de-duplication here for consistency
@@ -1191,6 +1308,38 @@ async function fetchMetricData(symbol, year, metric) {
     };
   }
 }
+
+
+// =========================================================================
+//  NEW ENDPOINT: /fetch-historical-average-rate
+// =========================================================================
+app.get("/fetch-historical-average-rate", async (req, res) => {
+    const { from, to, year } = req.query;
+    if (!from || !to || !year) {
+        return res.status(400).json({ error: "Missing required parameters: from, to, year." });
+    }
+
+    try {
+        const averageRate = await getHistoricalAverageRate(from.toUpperCase(), to.toUpperCase(), year);
+
+        if (averageRate === null) {
+            return res.status(404).json({ error: `Could not calculate an average rate for ${from}-${to} for the year ${year}.` });
+        }
+
+        res.json({
+            fromCurrency: from.toUpperCase(),
+            toCurrency: to.toUpperCase(),
+            year: year,
+            averageRate: averageRate
+        });
+
+    } catch (error) {
+        console.error(`[API-RATE-ERROR] Unhandled error in /fetch-historical-average-rate: ${error.message}`);
+        res.status(500).json({ error: "Internal server error." });
+    }
+});
+
+
 
 // =========================================================================
 //  SERVER START
