@@ -29,19 +29,33 @@ const historicalRateCache = new Map();
  * @param {string} date - e.g., '2023-01-15'
  * @returns {Promise<number|null>} The closing price for that day or null.
  */
+// =================================================================
+// PASTE THIS CORRECTED FUNCTION IN PLACE OF YOUR OLD ONE
+// =================================================================
+/**
+ * Fetches the historical exchange rate for a specific date from FMP.
+ * @param {string} currencyPair - e.g., 'EURUSD', 'SARUSD'
+ * @param {string} date - e.g., '2023-01-15'
+ * @returns {Promise<number|null>} The closing price for that day or null.
+ */
 async function fetchRateForDate(currencyPair, date) {
     // Note: You need to use the correct endpoint for forex.
-    // The endpoint should be for the currency pair, e.g., EURUSD, not a stock symbol.
     const url = `https://financialmodelingprep.com/api/v3/historical-price-full/${currencyPair}?from=${date}&to=${date}&apikey=${API_KEY}`;
     try {
         const data = await fetchDataWithRetry(url);
-        // The API returns a 'historical' array.
-        if (data && data.historical && data.historical.length > 0) {
-            return data.historical[0].close;
+
+        // --- FIX START ---
+        // The API returns a direct array, not an object with a 'historical' key.
+        // We check if the response is an array and has at least one item.
+        if (Array.isArray(data) && data.length > 0) {
+            // The price is in a 'price' field, not 'close'.
+            return data[0].price; 
         }
+        // --- FIX END ---
+
         console.warn(`[HISTORICAL-RATE] No data found for ${currencyPair} on ${date}.`);
         return null;
-    } catch (error) {
+    } catch (error)
         console.error(`[HISTORICAL-RATE] Error fetching rate for ${currencyPair} on ${date}: ${error.message}`);
         return null;
     }
