@@ -679,8 +679,8 @@ async function fetchMetricData(symbol, year, metric) {
 
   try {
     const endpointData = await getCachedAnnualData(symbol, info.endpoint);
-    const yearData = Array.isArray(endpointData) ? endpointData.find((d) => String(d.fiscalYear) === String(year)) : null;
-
+    // THIS IS THE CORRECTED LINE
+    const yearData = Array.isArray(endpointData) ? endpointData.find((d) => String(d.fiscalYear) === String(year) || (d.date && d.date.startsWith(String(year)))) : null;
     return {
       symbol,
       [metric]: yearData && yearData[info.field] != null ? yearData[info.field] : "N/A",
