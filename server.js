@@ -667,8 +667,7 @@ const fullMetricEndpointMap = {  marketCap: { endpoint: "key-metrics", field: "m
 
 async function fetchMetricData(symbol, year, metric) {
   if (metric === "revenuePerFte") {
-    // ... This special case logic remains unchanged
-    return { symbol, [metric]: "N/A" }; // Placeholder
+    return { symbol, [metric]: "N/A" };
   }
   
   const info = fullMetricEndpointMap[metric];
@@ -678,9 +677,21 @@ async function fetchMetricData(symbol, year, metric) {
   }
 
   try {
+    // +++ ADD THIS FIRST DEBUGGING BLOCK +++
+    if (metric === 'returnOnAssets') {
+      console.log(`[DEBUG] Fetching 'returnOnAssets' for ${symbol} in ${year}. Endpoint: ${info.endpoint}`);
+    }
+
     const endpointData = await getCachedAnnualData(symbol, info.endpoint);
-    // THIS IS THE CORRECTED LINE
+
+    // +++ ADD THIS SECOND DEBUGGING BLOCK +++
+    if (metric === 'returnOnAssets') {
+      console.log(`[DEBUG] API Response for ${symbol} from ${info.endpoint}:`, JSON.stringify(endpointData, null, 2));
+    }
+
+    // This is your already-corrected line
     const yearData = Array.isArray(endpointData) ? endpointData.find((d) => String(d.fiscalYear) === String(year) || (d.date && d.date.startsWith(String(year)))) : null;
+    
     return {
       symbol,
       [metric]: yearData && yearData[info.field] != null ? yearData[info.field] : "N/A",
