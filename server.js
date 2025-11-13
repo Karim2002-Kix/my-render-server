@@ -928,7 +928,7 @@ const fullMetricEndpointMap = {
         field: "cashRatio"
     },
     returnOnAssets: {
-        endpoint: "ratios",
+        endpoint: "key-metrics",
         field: "returnOnAssets"
     },
     returnOnCapitalEmployed: {
